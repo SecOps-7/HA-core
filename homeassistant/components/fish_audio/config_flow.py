@@ -30,6 +30,7 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 
+from . import async_create_client
 from .const import (
     API_KEYS_URL,
     BACKEND_MODELS,
@@ -166,7 +167,7 @@ async def _validate_api_key(
     hass: HomeAssistant, api_key: str
 ) -> tuple[str, AsyncFishAudio]:
     """Validate the user input allows us to connect."""
-    client = AsyncFishAudio(api_key=api_key)
+    client = await async_create_client(hass, api_key)
 
     try:
         # Validate API key and get user info

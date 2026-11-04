@@ -1,5 +1,6 @@
 """The Fish Audio integration."""
 
+from functools import partial
 import logging
 
 from fishaudio import AsyncFishAudio
@@ -16,9 +17,15 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS: list[Platform] = [Platform.TTS]
 
 
+async def async_create_client(hass: HomeAssistant, api_key: str) -> AsyncFishAudio:
+    """Create a Fish Audio client."""
+    # The SDK's httpx client loads the CA bundle on creation, which blocks.
+    return await hass.async_add_executor_job(partial(AsyncFishAudio, api_key=api_key))
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: FishAudioConfigEntry) -> None:
     """Set up Fish Audio from a config entry."""
-    client = AsyncFishAudio(api_key=entry.data[CONF_API_KEY])
+    client = await async_create_client(hass, entry.data[CONF_API_KEY])
 
     try:
         # Validate API key by getting account credits.
