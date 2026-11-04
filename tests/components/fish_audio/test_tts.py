@@ -4,11 +4,13 @@ import asyncio
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-from fishaudio import RateLimitError
+from fishaudio import AuthenticationError, RateLimitError
 from fishaudio.exceptions import ServerError
+from httpx_ws import WebSocketUpgradeError
 import pytest
 from pytest_homeassistant.common import MockConfigEntry, async_mock_service
 from pytest_homeassistant.typing import ClientSessionGenerator
@@ -22,13 +24,14 @@ from homeassistant.components.fish_audio.const import (
     DEFAULT_SPEED,
     DOMAIN,
 )
+from homeassistant.components.fish_audio.error import UnexpectedError
 from homeassistant.components.media_player import (
     ATTR_MEDIA_CONTENT_ID,
     DOMAIN as MP_DOMAIN,
     SERVICE_PLAY_MEDIA,
 )
 from homeassistant.components.tts import TTSAudioRequest
-from homeassistant.config_entries import ConfigSubentryData
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigSubentryData
 from homeassistant.const import ATTR_ENTITY_ID, CONF_API_KEY
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.core_config import async_process_ha_core_config
@@ -557,3 +560,81 @@ async def test_tts_stream_close_raises_other_errors(
     with pytest.raises(ExceptionGroup) as exc_info:
         await response.data_gen.aclose()
     assert [type(err) for err in exc_info.value.exceptions] == [OSError]
+
+
+async def _stream_refused(entity: tts.TextToSpeechEntity) -> None:
+    """Read a stream whose WebSocket upgrade is refused."""
+
+    async def message() -> AsyncGenerator[str]:
+        yield "Hello"
+
+    response = await entity.async_stream_tts_audio(
+        TTSAudioRequest(language="en", options={}, message_gen=message())
+    )
+    [chunk async for chunk in response.data_gen]
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "reauth_flows"),
+    [
+        pytest.param(401, "Invalid Fish Audio API key", 1, id="invalid-key"),
+        pytest.param(402, "insufficient credits", 0, id="no-credits"),
+        pytest.param(403, "not allowed to use this voice", 0, id="forbidden"),
+        pytest.param(429, "Rate limited by Fish Audio", 0, id="rate-limited"),
+        pytest.param(500, r"refused the connection \(HTTP 500\)", 0, id="other"),
+    ],
+)
+async def test_tts_stream_upgrade_refused(
+    hass: HomeAssistant,
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    status: int,
+    message: str,
+    reauth_flows: int,
+) -> None:
+    """Test a refused WebSocket upgrade gives a clear error, and reauth on 401."""
+    error = WebSocketUpgradeError(SimpleNamespace(status_code=status))
+    mock_fishaudio_client.tts.stream_websocket.side_effect = lambda *_args, **_kwargs: (
+        _failing_stream(error)
+    )
+
+    with pytest.raises(HomeAssistantError, match=message) as exc_info:
+        await _stream_refused(tts_entity)
+    assert not isinstance(exc_info.value, UnexpectedError)
+    await hass.async_block_till_done()
+
+    flows = mock_config_entry.async_get_active_flows(hass, {SOURCE_REAUTH})
+    assert len(list(flows)) == reauth_flows
+
+
+async def test_tts_rest_invalid_key_starts_reauth(
+    hass: HomeAssistant,
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test a rejected API key over REST starts reauthentication."""
+    mock_fishaudio_client.tts.convert.side_effect = AuthenticationError(
+        401, "Invalid API key"
+    )
+
+    with pytest.raises(HomeAssistantError, match="Invalid Fish Audio API key"):
+        await tts_entity.async_get_tts_audio(message="Hello", language="en", options={})
+    await hass.async_block_till_done()
+
+    flows = mock_config_entry.async_get_active_flows(hass, {SOURCE_REAUTH})
+    assert len(list(flows)) == 1
+
+
+async def test_tts_stream_unknown_error(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test an error without an HTTP status is reported as unexpected."""
+    mock_fishaudio_client.tts.stream_websocket.side_effect = lambda *_args, **_kwargs: (
+        _failing_stream(RuntimeError("boom"))
+    )
+
+    with pytest.raises(UnexpectedError):
+        await _stream_refused(tts_entity)

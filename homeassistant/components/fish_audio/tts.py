@@ -5,7 +5,12 @@ from enum import StrEnum
 import logging
 from typing import Any, override
 
-from fishaudio.exceptions import APIError, RateLimitError, WebSocketError
+from fishaudio.exceptions import (
+    APIError,
+    AuthenticationError,
+    RateLimitError,
+    WebSocketError,
+)
 
 from homeassistant.components.tts import (
     TextToSpeechEntity,
@@ -35,6 +40,20 @@ from .types import FishAudioConfigEntry
 
 PARALLEL_UPDATES = 1
 _LOGGER = logging.getLogger(__name__)
+
+
+_UPGRADE_ERRORS = {
+    401: "Invalid Fish Audio API key",
+    402: "Fish Audio account has insufficient credits",
+    403: "Fish Audio API key is not allowed to use this voice or model",
+    429: "Rate limited by Fish Audio",
+}
+
+
+def _upgrade_status(err: Exception) -> int | None:
+    """Return the HTTP status if Fish Audio refused the WebSocket upgrade."""
+    # httpx-ws raises WebSocketUpgradeError with the refused httpx response.
+    return getattr(getattr(err, "response", None), "status_code", None)
 
 
 async def _close_stream(stream: AsyncGenerator[bytes]) -> None:
@@ -92,6 +111,7 @@ class FishAudioTTSEntity(TextToSpeechEntity):
 
     def __init__(self, entry: FishAudioConfigEntry, sub_entry: ConfigSubentry) -> None:
         """Initialize the TTS entity."""
+        self._entry = entry
         self.client = entry.runtime_data
         self.sub_entry = sub_entry
         self._attr_unique_id = sub_entry.subentry_id
@@ -174,6 +194,9 @@ class FishAudioTTSEntity(TextToSpeechEntity):
                 model=backend,
                 format="mp3",
             )
+        except AuthenticationError as err:
+            self._entry.async_start_reauth(self.hass)
+            raise HomeAssistantError(_UPGRADE_ERRORS[401]) from err
         except RateLimitError as err:
             raise HomeAssistantError(f"Rate limited: {err}") from err
         except APIError as err:
@@ -214,7 +237,15 @@ class FishAudioTTSEntity(TextToSpeechEntity):
                     f"Websocket connection closed unexpectedly: {err}"
                 ) from err
             except Exception as err:
-                raise UnexpectedError(err) from err
+                if (status := _upgrade_status(err)) is None:
+                    raise UnexpectedError(err) from err
+                if status == 401:
+                    self._entry.async_start_reauth(self.hass)
+                raise HomeAssistantError(
+                    _UPGRADE_ERRORS.get(
+                        status, f"Fish Audio refused the connection (HTTP {status})"
+                    )
+                ) from err
             finally:
                 await _close_stream(stream)
 
