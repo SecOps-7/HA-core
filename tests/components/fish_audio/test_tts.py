@@ -1,8 +1,10 @@
 """Tests for the Fish Audio TTS entity."""
 
+import asyncio
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from fishaudio import RateLimitError
@@ -465,3 +467,93 @@ async def test_tts_service_speak_rate_limit_error(
         await retrieve_media(hass, hass_client, calls[0].data[ATTR_MEDIA_CONTENT_ID])
         == HTTPStatus.INTERNAL_SERVER_ERROR
     )
+
+
+@pytest.fixture
+async def tts_entity(
+    hass: HomeAssistant,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> tts.TextToSpeechEntity:
+    """Set up the integration and return the first TTS entity."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    entity = hass.data[tts.DOMAIN].get_entity("tts.test_voice_test_voice")
+    assert entity is not None
+    return entity
+
+
+async def _abandon_stream(entity: tts.TextToSpeechEntity) -> tts.TTSAudioResponse:
+    """Read the first audio chunk, then stop reading the stream."""
+
+    async def message() -> AsyncGenerator[str]:
+        yield "Hello"
+
+    response = await entity.async_stream_tts_audio(
+        TTSAudioRequest(language="en", options={}, message_gen=message())
+    )
+    assert await anext(response.data_gen) == b"chunk"
+    return response
+
+
+async def test_tts_stream_closed_when_abandoned(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test the SDK stream is closed in the reading task when reading stops."""
+    closed_in: list[asyncio.Task | None] = []
+
+    async def stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        try:
+            yield b"chunk"
+            yield b"chunk"
+        finally:
+            closed_in.append(asyncio.current_task())
+
+    mock_fishaudio_client.tts.stream_websocket.side_effect = stream
+
+    response = await _abandon_stream(tts_entity)
+    await response.data_gen.aclose()
+
+    assert closed_in == [asyncio.current_task()]
+
+
+async def test_tts_stream_close_ignores_httpx_ws_echo(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test the GeneratorExit group httpx-ws raises on close is not propagated."""
+
+    async def stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        try:
+            yield b"chunk"
+        except GeneratorExit as err:
+            raise BaseExceptionGroup("unhandled errors in a TaskGroup", [err]) from None
+
+    mock_fishaudio_client.tts.stream_websocket.side_effect = stream
+
+    response = await _abandon_stream(tts_entity)
+    await response.data_gen.aclose()
+
+
+async def test_tts_stream_close_raises_other_errors(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test an error raised while closing the SDK stream is not swallowed."""
+
+    async def stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        try:
+            yield b"chunk"
+        except GeneratorExit as err:
+            raise BaseExceptionGroup(
+                "unhandled errors in a TaskGroup", [err, OSError("socket broke")]
+            ) from None
+
+    mock_fishaudio_client.tts.stream_websocket.side_effect = stream
+
+    response = await _abandon_stream(tts_entity)
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await response.data_gen.aclose()
+    assert [type(err) for err in exc_info.value.exceptions] == [OSError]

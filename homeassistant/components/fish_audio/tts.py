@@ -37,6 +37,19 @@ PARALLEL_UPDATES = 1
 _LOGGER = logging.getLogger(__name__)
 
 
+async def _close_stream(stream: AsyncGenerator[bytes]) -> None:
+    """Close the SDK stream in the task that consumed it."""
+    # Left to garbage collection, httpx-ws closes the WebSocket from another
+    # task and cancels the task that opened it.
+    try:
+        await stream.aclose()
+    except BaseExceptionGroup as group:
+        # httpx-ws wraps the GeneratorExit of our own close in a group.
+        _, rest = group.split(GeneratorExit)
+        if rest is not None:
+            raise rest from None
+
+
 class FishAudioTextToSpeechOption(StrEnum):
     """Store keys for the Fish Audio text-to-speech options."""
 
@@ -202,5 +215,7 @@ class FishAudioTTSEntity(TextToSpeechEntity):
                 ) from err
             except Exception as err:
                 raise UnexpectedError(err) from err
+            finally:
+                await _close_stream(stream)
 
         return TTSAudioResponse("mp3", gen())
