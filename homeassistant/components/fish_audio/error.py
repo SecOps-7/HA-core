@@ -35,6 +35,14 @@ class CannotGetModelsError(FishAudioError):
         super().__init__("Cannot get models")
 
 
+class VoiceNotFoundError(FishAudioError):
+    """Error to indicate Fish Audio has no voice with the given ID."""
+
+    def __init__(self, exc: Exception) -> None:
+        """Initialize the voice not found error."""
+        super().__init__("Voice not found")
+
+
 class UnexpectedError(FishAudioError):
     """Error to indicate an unexpected error."""
 

@@ -1,8 +1,10 @@
 """Config flow tests for Fish Audio."""
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from fishaudio import AuthenticationError, FishAudioError
+from fishaudio.exceptions import APIError, NotFoundError, ServerError
 from fishaudio.types.account import Credits
 import pytest
 from pytest_homeassistant.common import MockConfigEntry
@@ -18,10 +20,12 @@ from homeassistant.components.fish_audio.const import (
     CONF_VOICE_ID,
     DOMAIN,
 )
-from homeassistant.config_entries import SOURCE_USER
+from homeassistant.config_entries import SOURCE_USER, SubentryFlowResult
 from homeassistant.const import CONF_API_KEY, CONF_LANGUAGE, CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+
+from .const import mock_voice
 
 
 @pytest.mark.usefixtures("mock_setup_entry")
@@ -216,6 +220,10 @@ async def test_subflow_happy_path(
         (mock_config_entry.entry_id, "tts"),
         context={"source": SOURCE_USER},
     )
+    assert result["type"] is FlowResultType.MENU
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "init"}
+    )
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
 
@@ -270,6 +278,10 @@ async def test_subflow_cannot_connect(
         (mock_config_entry.entry_id, "tts"),
         context={"source": SOURCE_USER},
     )
+    assert result["type"] is FlowResultType.MENU
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "init"}
+    )
 
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"],
@@ -295,6 +307,10 @@ async def test_subflow_no_models_found(
         (mock_config_entry.entry_id, "tts"),
         context={"source": SOURCE_USER},
     )
+    assert result["type"] is FlowResultType.MENU
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "init"}
+    )
 
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"],
@@ -319,20 +335,6 @@ async def test_subflow_reconfigure(
     result = await hass.config_entries.subentries.async_init(
         (mock_config_entry.entry_id, "tts"),
         context={"source": "reconfigure", "subentry_id": subentry.subentry_id},
-    )
-
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "init"
-
-    # Step through reconfigure
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"],
-        user_input={
-            CONF_TITLE: "",
-            CONF_LANGUAGE: "es",
-            CONF_SORT_BY: "task_count",
-            CONF_SELF_ONLY: False,
-        },
     )
 
     assert result["type"] is FlowResultType.FORM
@@ -372,20 +374,6 @@ async def test_subflow_reconfigure_already_configured(
     result = await hass.config_entries.subentries.async_init(
         (mock_config_entry.entry_id, "tts"),
         context={"source": "reconfigure", "subentry_id": first_subentry.subentry_id},
-    )
-
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "init"
-
-    # Step through reconfigure
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"],
-        user_input={
-            CONF_TITLE: "",
-            CONF_LANGUAGE: "en",
-            CONF_SORT_BY: "task_count",
-            CONF_SELF_ONLY: False,
-        },
     )
 
     assert result["type"] is FlowResultType.FORM
@@ -435,6 +423,10 @@ async def test_subflow_model_options(
         (mock_config_entry.entry_id, "tts"),
         context={"source": SOURCE_USER},
     )
+    assert result["type"] is FlowResultType.MENU
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "init"}
+    )
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"],
         user_input={
@@ -456,3 +448,306 @@ async def test_subflow_model_options(
     assert list(labels) == ["s2.1-pro", "s2.1-pro-free", "s2-pro", "drama-3", "s1"]
     assert "recommended" in labels["s2.1-pro"]
     assert "deprecated" in labels["s1"]
+
+
+async def _start_add_by_id(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> SubentryFlowResult:
+    """Set up the account and open the "Enter a voice ID" step."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    result = await hass.config_entries.subentries.async_init(
+        (mock_config_entry.entry_id, "tts"),
+        context={"source": SOURCE_USER},
+    )
+    assert result["type"] is FlowResultType.MENU
+    assert result["menu_options"] == ["init", "voice_id"]
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "voice_id"}
+    )
+    assert result["step_id"] == "voice_id"
+    return result
+
+
+async def test_subflow_add_by_voice_id(
+    hass: HomeAssistant,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test adding a voice by ID skips the search and names it after the voice."""
+    result = await _start_add_by_id(hass, mock_config_entry)
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], user_input={CONF_VOICE_ID: "  voice-delta  "}
+    )
+
+    mock_fishaudio_client.voices.get.assert_awaited_once_with("voice-delta")
+    mock_fishaudio_client.voices.list.assert_not_called()
+    assert result["step_id"] == "model"
+    schema = result["data_schema"].schema
+    voice_key = next(key for key in schema if key == CONF_VOICE_ID)
+    assert schema[voice_key].config["options"] == [
+        {"value": "voice-delta", "label": "Voice voice-delta"}
+    ]
+    name_key = next(key for key in schema if key == CONF_NAME)
+    assert name_key.default() == "Voice voice-delta"
+    assert "search_again" not in schema
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_VOICE_ID: "voice-delta",
+            CONF_BACKEND: "s2-pro",
+            CONF_LATENCY: "balanced",
+            CONF_SPEED: 1.0,
+            CONF_NAME: "Delta",
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Delta"
+    assert result["data"][CONF_VOICE_ID] == "voice-delta"
+    assert result["unique_id"] == "voice-delta-s2-pro"
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "errors"),
+    [
+        pytest.param(
+            NotFoundError(404, "Not found"),
+            {CONF_VOICE_ID: "voice_not_found"},
+            id="not-found",
+        ),
+        pytest.param(
+            APIError(400, "Bad request"),
+            {CONF_VOICE_ID: "voice_not_found"},
+            id="bad-request",
+        ),
+        pytest.param(
+            ServerError(500, "Server error"), {"base": "cannot_connect"}, id="server"
+        ),
+        pytest.param(
+            Exception("Unexpected"), {"base": "cannot_connect"}, id="unexpected"
+        ),
+        pytest.param(
+            lambda voice_id: mock_voice(voice_id, "svc"),
+            {CONF_VOICE_ID: "not_tts_voice"},
+            id="singing-voice",
+        ),
+    ],
+)
+async def test_subflow_add_by_voice_id_errors(
+    hass: HomeAssistant,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    side_effect: Any,
+    errors: dict[str, str],
+) -> None:
+    """Test a voice ID Fish Audio can't use shows an error, then recovers."""
+    result = await _start_add_by_id(hass, mock_config_entry)
+
+    mock_fishaudio_client.voices.get.side_effect = side_effect
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], user_input={CONF_VOICE_ID: "voice-typo"}
+    )
+    assert result["step_id"] == "voice_id"
+    assert result["errors"] == errors
+
+    mock_fishaudio_client.voices.get.side_effect = mock_voice
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], user_input={CONF_VOICE_ID: "voice-delta"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_VOICE_ID: "voice-delta",
+            CONF_BACKEND: "s2.1-pro",
+            CONF_LATENCY: "balanced",
+            CONF_SPEED: 1.0,
+            CONF_NAME: "Delta",
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_subflow_typed_voice_is_checked(
+    hass: HomeAssistant,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test a voice typed into the voice dropdown is checked with Fish Audio."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    result = await hass.config_entries.subentries.async_init(
+        (mock_config_entry.entry_id, "tts"),
+        context={"source": SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "init"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_TITLE: "",
+            CONF_LANGUAGE: "en",
+            CONF_SORT_BY: "task_count",
+            CONF_SELF_ONLY: False,
+        },
+    )
+    settings = {
+        CONF_BACKEND: "s2.1-pro",
+        CONF_LATENCY: "balanced",
+        CONF_SPEED: 1.0,
+        CONF_NAME: "Mine",
+    }
+
+    mock_fishaudio_client.voices.get.side_effect = NotFoundError(404, "Not found")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], user_input={CONF_VOICE_ID: "voice-typo", **settings}
+    )
+    assert result["errors"] == {CONF_VOICE_ID: "voice_not_found"}
+
+    # A voice from the search results needs no extra lookup.
+    mock_fishaudio_client.voices.get.reset_mock()
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], user_input={CONF_VOICE_ID: "voice-alpha", **settings}
+    )
+    mock_fishaudio_client.voices.get.assert_not_called()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_subflow_reconfigure_shows_current_settings(
+    hass: HomeAssistant,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reconfigure opens the current settings and can rename the voice."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    subentry = list(mock_config_entry.subentries.values())[0]
+
+    result = await hass.config_entries.subentries.async_init(
+        (mock_config_entry.entry_id, "tts"),
+        context={"source": "reconfigure", "subentry_id": subentry.subentry_id},
+    )
+
+    schema = result["data_schema"].schema
+    voice_key = next(key for key in schema if key == CONF_VOICE_ID)
+    assert voice_key.default() == "voice-123"
+    assert schema[voice_key].config["options"] == [
+        {"value": "voice-123", "label": "Voice voice-123"}
+    ]
+    name_key = next(key for key in schema if key == CONF_NAME)
+    assert name_key.default() == "Test Voice"
+    assert "search_again" in schema
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_VOICE_ID: "voice-123",
+            CONF_BACKEND: "drama-3",
+            CONF_LATENCY: "normal",
+            CONF_SPEED: 1.0,
+            CONF_NAME: "Renamed Voice",
+        },
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    subentry = mock_config_entry.subentries[subentry.subentry_id]
+    assert subentry.title == "Renamed Voice"
+    assert subentry.data[CONF_BACKEND] == "drama-3"
+
+
+async def test_subflow_reconfigure_voice_lookup_fails(
+    hass: HomeAssistant,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test settings still open, showing the raw ID, if the voice can't be fetched."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    subentry = list(mock_config_entry.subentries.values())[0]
+
+    mock_fishaudio_client.voices.get.side_effect = ServerError(500, "Server error")
+    result = await hass.config_entries.subentries.async_init(
+        (mock_config_entry.entry_id, "tts"),
+        context={"source": "reconfigure", "subentry_id": subentry.subentry_id},
+    )
+
+    assert result["step_id"] == "model"
+    schema = result["data_schema"].schema
+    voice_key = next(key for key in schema if key == CONF_VOICE_ID)
+    assert schema[voice_key].config["options"] == [
+        {"value": "voice-123", "label": "voice-123"}
+    ]
+
+
+async def test_subflow_reconfigure_search_again(
+    hass: HomeAssistant,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reconfigure can still search for a different voice."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    subentry = list(mock_config_entry.subentries.values())[0]
+
+    result = await hass.config_entries.subentries.async_init(
+        (mock_config_entry.entry_id, "tts"),
+        context={"source": "reconfigure", "subentry_id": subentry.subentry_id},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_VOICE_ID: "voice-123",
+            CONF_BACKEND: "s2.1-pro",
+            CONF_LATENCY: "balanced",
+            CONF_SPEED: 1.0,
+            CONF_NAME: "Test Voice",
+            "search_again": True,
+        },
+    )
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_TITLE: "Alpha",
+            CONF_LANGUAGE: "en",
+            CONF_SORT_BY: "task_count",
+            CONF_SELF_ONLY: False,
+        },
+    )
+    assert result["step_id"] == "model"
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_VOICE_ID: "voice-alpha",
+            CONF_BACKEND: "s2.1-pro",
+            CONF_LATENCY: "balanced",
+            CONF_SPEED: 1.0,
+            CONF_NAME: "Alpha Voice",
+        },
+    )
+    assert result["reason"] == "reconfigure_successful"
+    assert (
+        mock_config_entry.subentries[subentry.subentry_id].data[CONF_VOICE_ID]
+        == "voice-alpha"
+    )
+
+
+async def test_subflow_reconfigure_entry_not_loaded(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Test reconfiguring a voice while the account is not loaded."""
+    mock_config_entry.add_to_hass(hass)
+    subentry = list(mock_config_entry.subentries.values())[0]
+
+    result = await hass.config_entries.subentries.async_init(
+        (mock_config_entry.entry_id, "tts"),
+        context={"source": "reconfigure", "subentry_id": subentry.subentry_id},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "entry_not_loaded"

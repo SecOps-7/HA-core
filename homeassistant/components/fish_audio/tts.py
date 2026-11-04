@@ -130,6 +130,7 @@ class FishAudioTTSEntity(TextToSpeechEntity):
             identifiers={(DOMAIN, sub_entry.subentry_id)},
             manufacturer="Fish Audio",
             model=backend,
+            model_id=sub_entry.data.get(CONF_VOICE_ID),
             name=title,
             entry_type=DeviceEntryType.SERVICE,
         )

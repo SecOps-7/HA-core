@@ -5,7 +5,13 @@ import logging
 from typing import Any, override
 
 from fishaudio import AsyncFishAudio
-from fishaudio.exceptions import AuthenticationError, FishAudioError
+from fishaudio.exceptions import (
+    APIError,
+    AuthenticationError,
+    FishAudioError,
+    NotFoundError,
+)
+from fishaudio.types import Voice
 import probatio
 
 from homeassistant.config_entries import (
@@ -57,6 +63,7 @@ from .error import (
     CannotGetModelsError,
     InvalidAuthError,
     UnexpectedError,
+    VoiceNotFoundError,
 )
 from .types import FishAudioConfigEntry
 
@@ -113,12 +120,30 @@ def get_filter_schema(options: dict[str, Any]) -> probatio.Schema:
     )
 
 
+CONF_SEARCH_AGAIN = "search_again"
+
+# Fish Audio voice types; "svc" is singing voice conversion, not TTS.
+VOICE_TYPE_TTS = "tts"
+
+
+def get_voice_id_schema(options: dict[str, Any]) -> probatio.Schema:
+    """Return the schema for entering a voice ID."""
+    return probatio.Schema(
+        {
+            probatio.Required(
+                CONF_VOICE_ID, default=options.get(CONF_VOICE_ID) or probatio.UNDEFINED
+            ): str,
+        }
+    )
+
+
 def get_model_selection_schema(
     options: dict[str, Any],
     model_options: list[SelectOptionDict],
+    reconfigure: bool = False,
 ) -> probatio.Schema:
     """Return the schema for the model selection step."""
-    return probatio.Schema(
+    schema = probatio.Schema(
         {
             probatio.Required(
                 CONF_VOICE_ID,
@@ -173,6 +198,11 @@ def get_model_selection_schema(
             ): str,
         }
     )
+    if reconfigure:
+        schema = schema.extend(
+            {probatio.Optional(CONF_SEARCH_AGAIN, default=False): bool}
+        )
+    return schema
 
 
 async def _validate_api_key(
@@ -308,6 +338,14 @@ class FishAudioSubentryFlowHandler(ConfigSubentryFlow):
         super().__init__()
         self.models: list[SelectOptionDict] = []
 
+    def _parent_loaded(self) -> bool:
+        """Use the account's client, if the account is loaded."""
+        entry = self._get_entry()
+        if entry.state is not ConfigEntryState.LOADED:
+            return False
+        self.client = entry.runtime_data
+        return True
+
     async def _async_get_models(
         self, self_only: bool, language: str | None, title: str | None, sort_by: str
     ) -> list[SelectOptionDict]:
@@ -334,32 +372,91 @@ class FishAudioSubentryFlowHandler(ConfigSubentryFlow):
             for voice in voices
         ]
 
+    async def _async_get_voice(self, voice_id: str) -> Voice:
+        """Look up one voice by ID."""
+        try:
+            return await self.client.voices.get(voice_id)
+        except NotFoundError as exc:
+            raise VoiceNotFoundError(exc) from exc
+        except APIError as exc:
+            if exc.status in (400, 422):
+                raise VoiceNotFoundError(exc) from exc
+            raise CannotGetModelsError(exc) from exc
+        except Exception as exc:
+            raise CannotGetModelsError(exc) from exc
+
+    async def _async_check_voice(
+        self, voice_id: str
+    ) -> tuple[Voice | None, dict[str, str]]:
+        """Check a voice ID with Fish Audio, returning the voice or form errors."""
+        try:
+            voice = await self._async_get_voice(voice_id)
+        except VoiceNotFoundError:
+            return None, {CONF_VOICE_ID: "voice_not_found"}
+        except CannotGetModelsError:
+            return None, {"base": "cannot_connect"}
+        if voice.type != VOICE_TYPE_TTS:
+            return None, {CONF_VOICE_ID: "not_tts_voice"}
+        return voice, {}
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> SubentryFlowResult:
-        """Handle the initial step."""
+        """Ask whether to search for a voice or enter its ID."""
+        if not self._parent_loaded():
+            return self.async_abort(reason="entry_not_loaded")
         self.config_data = {}
-        return await self.async_step_init()
+        return self.async_show_menu(step_id="user", menu_options=["init", "voice_id"])
+
+    async def async_step_voice_id(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Add a voice by its Fish Audio voice ID."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            voice, errors = await self._async_check_voice(
+                user_input[CONF_VOICE_ID].strip()
+            )
+            if voice is not None:
+                self.config_data[CONF_VOICE_ID] = voice.id
+                self.config_data.setdefault(CONF_NAME, voice.title)
+                self.models = [SelectOptionDict(value=voice.id, label=voice.title)]
+                return await self.async_step_model()
+
+        return self.async_show_form(
+            step_id="voice_id",
+            data_schema=get_voice_id_schema(self.config_data),
+            errors=errors,
+        )
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> SubentryFlowResult:
-        """Handle reconfiguration of a subentry."""
-        self.config_data = dict(self._get_reconfigure_subentry().data)
-        return await self.async_step_init()
+        """Open the voice's settings directly."""
+        if not self._parent_loaded():
+            return self.async_abort(reason="entry_not_loaded")
+
+        subentry = self._get_reconfigure_subentry()
+        self.config_data = dict(subentry.data)
+        self.config_data.setdefault(CONF_NAME, subentry.title)
+
+        voice_id = self.config_data[CONF_VOICE_ID]
+        try:
+            label = (await self._async_get_voice(voice_id)).title
+        except VoiceNotFoundError, CannotGetModelsError:
+            # Still allow changing the other settings.
+            label = voice_id
+        self.models = [SelectOptionDict(value=voice_id, label=label)]
+        return await self.async_step_model()
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> SubentryFlowResult:
-        """Manage initial options."""
-        entry = self._get_entry()
-        if entry.state is not ConfigEntryState.LOADED:
-            return self.async_abort(reason="entry_not_loaded")
-
-        self.client = entry.runtime_data
-
+        """Search Fish Audio's voices."""
         if user_input is not None:
             self.config_data.update(user_input)
+            self.models = []
             return await self.async_step_model()
 
         return self.async_show_form(
@@ -371,8 +468,9 @@ class FishAudioSubentryFlowHandler(ConfigSubentryFlow):
     async def async_step_model(
         self, user_input: dict[str, Any] | None = None
     ) -> SubentryFlowResult:
-        """Handle the model selection step."""
+        """Choose the voice, model, latency, speed and name."""
         errors: dict[str, str] = {}
+        reconfigure = self.source != SOURCE_USER
 
         if not self.models:
             try:
@@ -392,31 +490,41 @@ class FishAudioSubentryFlowHandler(ConfigSubentryFlow):
                 self.config_data[CONF_VOICE_ID] = self.models[0]["value"]
 
         if user_input is not None:
+            if user_input.pop(CONF_SEARCH_AGAIN, False):
+                return await self.async_step_init()
+
             if (
                 (voice_id := user_input.get(CONF_VOICE_ID))
                 and (backend := user_input.get(CONF_BACKEND))
                 and (name := user_input.get(CONF_NAME))
             ):
-                self.config_data.update(user_input)
-                unique_id = f"{voice_id}-{backend}"
+                if voice_id not in {model["value"] for model in self.models}:
+                    _, errors = await self._async_check_voice(voice_id)
 
-                if self.source == SOURCE_USER:
-                    return self.async_create_entry(
+                if not errors:
+                    self.config_data.update(user_input)
+                    unique_id = f"{voice_id}-{backend}"
+
+                    if not reconfigure:
+                        return self.async_create_entry(
+                            title=name,
+                            data=self.config_data,
+                            unique_id=unique_id,
+                        )
+
+                    return self.async_update_and_abort(
+                        self._get_entry(),
+                        self._get_reconfigure_subentry(),
                         title=name,
                         data=self.config_data,
                         unique_id=unique_id,
+                        reason="reconfigure_successful",
                     )
-
-                return self.async_update_and_abort(
-                    self._get_entry(),
-                    self._get_reconfigure_subentry(),
-                    data=self.config_data,
-                    unique_id=unique_id,
-                    reason="reconfigure_successful",
-                )
 
         return self.async_show_form(
             step_id="model",
-            data_schema=get_model_selection_schema(self.config_data, self.models),
+            data_schema=get_model_selection_schema(
+                self.config_data, self.models, reconfigure=reconfigure
+            ),
             errors=errors,
         )

@@ -17,7 +17,7 @@ from homeassistant.config_entries import ConfigSubentryDataWithId
 from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant
 
-from .const import MOCK_CREDITS, MOCK_VOICES
+from .const import MOCK_CREDITS, MOCK_VOICES, mock_voice
 
 
 @pytest.fixture
@@ -96,6 +96,7 @@ def mock_fishaudio_client() -> Generator[AsyncMock]:
         client.account.get_credits.return_value = MOCK_CREDITS
         client.voices = AsyncMock(spec=AsyncVoicesClient)
         client.voices.list.return_value = AsyncMock(items=MOCK_VOICES)
+        client.voices.get.side_effect = mock_voice
         client.tts = AsyncMock(spec=AsyncTTSClient)
         client.tts.convert.return_value = b"fake_audio_data"
         client.tts.stream_websocket.side_effect = lambda *_message_gen, **_kwargs: (

@@ -37,6 +37,7 @@ from homeassistant.const import ATTR_ENTITY_ID, CONF_API_KEY
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.core_config import async_process_ha_core_config
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import device_registry as dr
 
 from tests.components.tts.common import retrieve_media
 
@@ -759,3 +760,16 @@ async def test_tts_stored_retired_model_still_used(
     await entity.async_get_tts_audio(message="Hello", language="en", options={})
 
     assert mock_fishaudio_client.tts.convert.call_args.kwargs["model"] == "speech-1.6"
+
+
+@pytest.mark.usefixtures("tts_entity")
+async def test_tts_device_shows_voice_id(
+    mock_config_entry: MockConfigEntry,
+    device_registry: dr.DeviceRegistry,
+) -> None:
+    """Test each voice's device shows its Fish Audio voice ID as the model ID."""
+    device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "test-subentry-id"), mock_config_entry.entry_id
+    )
+    assert device is not None
+    assert device.model_id == "voice-123"
