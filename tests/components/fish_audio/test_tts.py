@@ -1,15 +1,15 @@
 """Tests for the Fish Audio TTS entity."""
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Generator
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
-from fishaudio import AsyncFishAudio, AuthenticationError, RateLimitError
-from fishaudio.exceptions import ServerError
+from fishaudio import AsyncFishAudio, AuthenticationError, FlushEvent, RateLimitError
+from fishaudio.exceptions import ServerError, WebSocketError
 from httpx_ws import WebSocketUpgradeError
 import pytest
 from pytest_homeassistant.common import MockConfigEntry, async_mock_service
@@ -50,6 +50,13 @@ def tts_mutagen_mock_fixture_autouse(tts_mutagen_mock: MagicMock) -> None:
 @pytest.fixture(autouse=True)
 def mock_tts_cache_dir_autouse(mock_tts_cache_dir: Path) -> None:
     """Mock the TTS cache dir with empty dir."""
+
+
+@pytest.fixture(autouse=True)
+def no_retry_delay() -> Generator[None]:
+    """Retry REST rate limits without waiting."""
+    with patch("homeassistant.components.fish_audio.tts.RETRY_DELAYS", (0, 0, 0)):
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -132,7 +139,11 @@ async def test_tts_stream_success(
         b"second audio chunk",
     ]
 
-    assert mock_fishaudio_client.tts.stream_websocket.call_args.args[0] == message_gen
+    sent = [
+        item
+        async for item in mock_fishaudio_client.tts.stream_websocket.call_args.args[0]
+    ]
+    assert sent == ["Hello, World!"]
     mock_fishaudio_client.tts.convert.assert_not_called()
 
 
@@ -164,7 +175,8 @@ async def test_tts_rate_limited(
         )
 
     # Verify the client was called
-    mock_fishaudio_client.tts.convert.assert_called_once()
+    # The first attempt and three retries
+    assert mock_fishaudio_client.tts.convert.call_count == 4
 
 
 async def test_tts_missing_voice_id(
@@ -418,6 +430,9 @@ async def test_tts_service_speak_server_error(
     mock_fishaudio_client.tts.stream_websocket.side_effect = lambda *_args, **_kwargs: (
         _failing_stream(ServerError(500, "Internal server error"))
     )
+    mock_fishaudio_client.tts.convert.side_effect = ServerError(
+        500, "Internal server error"
+    )
 
     await hass.services.async_call(
         tts.DOMAIN,
@@ -454,6 +469,9 @@ async def test_tts_service_speak_rate_limit_error(
     assert entry is not None
     mock_fishaudio_client.tts.stream_websocket.side_effect = lambda *_args, **_kwargs: (
         _failing_stream(RateLimitError(429, "Rate limit exceeded"))
+    )
+    mock_fishaudio_client.tts.convert.side_effect = RateLimitError(
+        429, "Rate limit exceeded"
     )
 
     await hass.services.async_call(
@@ -559,9 +577,11 @@ async def test_tts_stream_close_raises_other_errors(
     mock_fishaudio_client.tts.stream_websocket.side_effect = stream
 
     response = await _abandon_stream(tts_entity)
-    with pytest.raises(ExceptionGroup) as exc_info:
+    with pytest.raises(UnexpectedError) as exc_info:
         await response.data_gen.aclose()
-    assert [type(err) for err in exc_info.value.exceptions] == [OSError]
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, ExceptionGroup)
+    assert [type(err) for err in cause.exceptions] == [OSError]
 
 
 async def _stream_refused(entity: tts.TextToSpeechEntity) -> None:
@@ -582,8 +602,6 @@ async def _stream_refused(entity: tts.TextToSpeechEntity) -> None:
         pytest.param(401, "Invalid Fish Audio API key", 1, id="invalid-key"),
         pytest.param(402, "insufficient credits", 0, id="no-credits"),
         pytest.param(403, "not allowed to use this voice", 0, id="forbidden"),
-        pytest.param(429, "Rate limited by Fish Audio", 0, id="rate-limited"),
-        pytest.param(500, r"refused the connection \(HTTP 500\)", 0, id="other"),
     ],
 )
 async def test_tts_stream_upgrade_refused(
@@ -633,13 +651,17 @@ async def test_tts_stream_unknown_error(
     tts_entity: tts.TextToSpeechEntity,
     mock_fishaudio_client: AsyncMock,
 ) -> None:
-    """Test an error without an HTTP status is reported as unexpected."""
-    mock_fishaudio_client.tts.stream_websocket.side_effect = lambda *_args, **_kwargs: (
-        _failing_stream(RuntimeError("boom"))
-    )
+    """Test an unknown error after audio started is reported as unexpected."""
+
+    async def stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        yield b"chunk"
+        raise RuntimeError("boom")
+
+    mock_fishaudio_client.tts.stream_websocket.side_effect = stream
 
     with pytest.raises(UnexpectedError):
         await _stream_refused(tts_entity)
+    mock_fishaudio_client.tts.convert.assert_not_called()
 
 
 # The model header values in Fish Audio's API reference, written out so a
@@ -773,3 +795,378 @@ async def test_tts_device_shows_voice_id(
     )
     assert device is not None
     assert device.model_id == "voice-123"
+
+
+FLUSH = FlushEvent()
+
+
+async def _message(*parts: str) -> AsyncGenerator[str]:
+    """Yield message parts like Home Assistant streams text to the entity."""
+    for part in parts:
+        yield part
+
+
+def _capture_stream(sent: list[str | FlushEvent]) -> Callable[..., Any]:
+    """Return a stream_websocket replacement recording what is sent to Fish."""
+
+    async def stream(
+        text_stream: AsyncIterable[str | FlushEvent], **_kwargs: Any
+    ) -> AsyncGenerator[bytes]:
+        sent.extend([item async for item in text_stream])
+        yield b"chunk"
+
+    return stream
+
+
+def _stream_failing_after(
+    error: Exception, take: int = 0
+) -> Callable[..., AsyncGenerator[bytes]]:
+    """Return a stream_websocket replacement that reads some text, then fails."""
+
+    async def stream(
+        text_stream: AsyncIterable[str | FlushEvent], **_kwargs: Any
+    ) -> AsyncGenerator[bytes]:
+        iterator = aiter(text_stream)
+        for _ in range(take):
+            await anext(iterator)
+        raise error
+        yield b""  # Keep this an async generator
+
+    return stream
+
+
+@pytest.mark.parametrize(
+    ("parts", "expected"),
+    [
+        pytest.param(["Hel", "lo ", "wor", "ld"], ["Hello world"], id="joins-words"),
+        pytest.param(
+            ["one two ", "three fo", "ur five six se", "ven"],
+            ["one two three four five ", "six seven"],
+            id="five-words",
+        ),
+        pytest.param(
+            ["Hi there. How ", "are you? Fi", "ne"],
+            ["Hi there. ", FLUSH, "How are you? ", FLUSH, "Fine"],
+            id="flush-each-sentence",
+        ),
+        pytest.param(
+            ["Line one\nLine ", "two"], ["Line one\n", FLUSH, "Line two"], id="newline"
+        ),
+        pytest.param(
+            ['He said "go." ', "Then"],
+            ['He said "go." ', FLUSH, "Then"],
+            id="closing-quote",
+        ),
+        pytest.param(["Pi is 3.", "14 today"], ["Pi is 3.14 today"], id="decimal"),
+        pytest.param(
+            ["你好。今天", "怎么样？"],
+            ["你好。", FLUSH, "今天怎么样？", FLUSH],
+            id="cjk-punctuation",
+        ),
+        pytest.param(["x" * 60, "x" * 60], ["x" * 120], id="no-spaces-capped"),
+        pytest.param(
+            ["  Hello world. ", "Bye"],
+            ["  Hello world. ", FLUSH, "Bye"],
+            id="leading-whitespace",
+        ),
+        pytest.param([], [], id="empty"),
+    ],
+)
+async def test_tts_stream_text_buffering(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+    parts: list[str],
+    expected: list[str | FlushEvent],
+) -> None:
+    """Test text goes out as whole words, with a flush after each sentence."""
+    sent: list[str | FlushEvent] = []
+    mock_fishaudio_client.tts.stream_websocket.side_effect = _capture_stream(sent)
+
+    response = await tts_entity.async_stream_tts_audio(
+        TTSAudioRequest(language="en", options={}, message_gen=_message(*parts))
+    )
+    [chunk async for chunk in response.data_gen]
+
+    assert sent == expected
+
+
+async def test_tts_stream_sends_text_before_message_ends(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test a complete sentence is sent while the message is still being written."""
+    more_text = asyncio.Event()
+    first_sent: asyncio.Future[str | FlushEvent] = (
+        asyncio.get_running_loop().create_future()
+    )
+
+    async def slow_message() -> AsyncGenerator[str]:
+        yield "The first sentence is here. "
+        await more_text.wait()
+        yield "The rest."
+
+    async def stream(
+        text_stream: AsyncIterable[str | FlushEvent], **_kwargs: Any
+    ) -> AsyncGenerator[bytes]:
+        async for item in text_stream:
+            if not first_sent.done():
+                first_sent.set_result(item)
+        yield b"chunk"
+
+    mock_fishaudio_client.tts.stream_websocket.side_effect = stream
+    response = await tts_entity.async_stream_tts_audio(
+        TTSAudioRequest(language="en", options={}, message_gen=slow_message())
+    )
+    reader = asyncio.create_task(anext(response.data_gen))
+
+    assert await asyncio.wait_for(first_sent, 1) == "The first sentence is here. "
+    assert not reader.done()
+    more_text.set()
+    assert await reader == b"chunk"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(WebSocketUpgradeError(SimpleNamespace(status_code=429)), id="429"),
+        pytest.param(WebSocketUpgradeError(SimpleNamespace(status_code=500)), id="500"),
+        pytest.param(WebSocketError("WebSocket disconnected"), id="disconnect"),
+        pytest.param(RuntimeError("boom"), id="unknown"),
+    ],
+)
+async def test_tts_stream_falls_back_to_rest_before_audio(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+    error: Exception,
+) -> None:
+    """Test a WebSocket failure before any audio is retried over REST."""
+    mock_fishaudio_client.tts.stream_websocket.side_effect = _stream_failing_after(
+        error, take=1
+    )
+
+    response = await tts_entity.async_stream_tts_audio(
+        TTSAudioRequest(
+            language="en",
+            options={"speed": 1.25},
+            message_gen=_message("First sentence. ", "Second ", "sentence."),
+        )
+    )
+
+    assert [chunk async for chunk in response.data_gen] == [b"fake_audio_data"]
+    mock_fishaudio_client.tts.convert.assert_called_once_with(
+        text="First sentence. Second sentence.",
+        reference_id="voice-123",
+        latency="balanced",
+        speed=1.25,
+        model="s1",
+        format="mp3",
+    )
+
+
+async def test_tts_stream_no_fallback_after_audio(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test a failure after audio started is raised, not retried over REST."""
+
+    async def stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        yield b"partial"
+        raise WebSocketError("WebSocket disconnected")
+
+    mock_fishaudio_client.tts.stream_websocket.side_effect = stream
+    response = await tts_entity.async_stream_tts_audio(
+        TTSAudioRequest(language="en", options={}, message_gen=_message("Hello"))
+    )
+
+    assert await anext(response.data_gen) == b"partial"
+    with pytest.raises(HomeAssistantError, match="Websocket connection closed"):
+        await anext(response.data_gen)
+    mock_fishaudio_client.tts.convert.assert_not_called()
+
+
+async def test_tts_stream_no_fallback_for_empty_message(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test a failure with nothing to say makes no REST request."""
+    mock_fishaudio_client.tts.stream_websocket.side_effect = _stream_failing_after(
+        WebSocketError("WebSocket disconnected")
+    )
+    response = await tts_entity.async_stream_tts_audio(
+        TTSAudioRequest(language="en", options={}, message_gen=_message())
+    )
+
+    assert [chunk async for chunk in response.data_gen] == []
+    mock_fishaudio_client.tts.convert.assert_not_called()
+
+
+async def test_tts_stream_message_error(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test a failing message still lets Fish finish, then raises the error."""
+    sent: list[str | FlushEvent] = []
+    mock_fishaudio_client.tts.stream_websocket.side_effect = _capture_stream(sent)
+
+    async def failing_message() -> AsyncGenerator[str]:
+        yield "Hello there. "
+        raise HomeAssistantError("Conversation agent failed")
+
+    response = await tts_entity.async_stream_tts_audio(
+        TTSAudioRequest(language="en", options={}, message_gen=failing_message())
+    )
+
+    assert await anext(response.data_gen) == b"chunk"
+    with pytest.raises(HomeAssistantError, match="Conversation agent failed"):
+        await anext(response.data_gen)
+    assert sent == ["Hello there. ", FLUSH]
+
+
+async def test_tts_concurrent_requests_capped(
+    hass: HomeAssistant,
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test at most three requests per account run at once, across its voices."""
+    release = asyncio.Event()
+    open_streams = 0
+    most_open = 0
+
+    async def stream(
+        text_stream: AsyncIterable[str | FlushEvent], **_kwargs: Any
+    ) -> AsyncGenerator[bytes]:
+        nonlocal open_streams, most_open
+        open_streams += 1
+        most_open = max(most_open, open_streams)
+        try:
+            async for _ in text_stream:
+                pass
+            await release.wait()
+            yield b"chunk"
+        finally:
+            open_streams -= 1
+
+    mock_fishaudio_client.tts.stream_websocket.side_effect = stream
+    second_voice = hass.data[tts.DOMAIN].get_entity("tts.second_voice_second_voice")
+    assert second_voice is not None
+
+    async def speak(entity: tts.TextToSpeechEntity) -> list[bytes]:
+        response = await entity.async_stream_tts_audio(
+            TTSAudioRequest(language="en", options={}, message_gen=_message("Hi"))
+        )
+        return [chunk async for chunk in response.data_gen]
+
+    streams = [
+        asyncio.create_task(speak(entity)) for entity in (tts_entity, second_voice) * 3
+    ]
+    await hass.async_block_till_done()
+    assert mock_fishaudio_client.tts.stream_websocket.call_count == 3
+
+    rest = asyncio.create_task(
+        tts_entity.async_get_tts_audio(message="Hi", language="en", options={})
+    )
+    await hass.async_block_till_done()
+    mock_fishaudio_client.tts.convert.assert_not_called()
+
+    release.set()
+    results = await asyncio.wait_for(asyncio.gather(*streams, rest), 5)
+
+    assert results == [[b"chunk"]] * 6 + [("mp3", b"fake_audio_data")]
+    assert most_open == 3
+
+
+async def test_tts_slot_released_when_stream_abandoned(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test stopping a stream early frees its slot."""
+
+    async def stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        yield b"chunk"
+        yield b"chunk"
+
+    mock_fishaudio_client.tts.stream_websocket.side_effect = stream
+    for _ in range(4):
+        response = await _abandon_stream(tts_entity)
+        await response.data_gen.aclose()
+
+    assert await asyncio.wait_for(
+        tts_entity.async_get_tts_audio(message="Hi", language="en", options={}), 1
+    ) == ("mp3", b"fake_audio_data")
+
+
+async def test_tts_rest_retries_rate_limit(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test HTTP 429 over REST is retried with growing waits."""
+    mock_fishaudio_client.tts.convert.side_effect = [
+        RateLimitError(429, "Rate limited"),
+        RateLimitError(429, "Rate limited"),
+        RateLimitError(429, "Rate limited"),
+        b"fake_audio_data",
+    ]
+
+    with (
+        patch("homeassistant.components.fish_audio.tts.RETRY_DELAYS", (0.4, 0.8, 1.6)),
+        patch(
+            "homeassistant.components.fish_audio.tts.random.uniform", return_value=0.1
+        ) as mock_jitter,
+        patch(
+            "homeassistant.components.fish_audio.tts.asyncio.sleep", new=AsyncMock()
+        ) as mock_sleep,
+    ):
+        result = await tts_entity.async_get_tts_audio(
+            message="Hello", language="en", options={}
+        )
+
+    assert result == ("mp3", b"fake_audio_data")
+    assert mock_jitter.call_args_list == [call(0, 0.2), call(0, 0.4), call(0, 0.8)]
+    assert [c.args[0] for c in mock_sleep.await_args_list] == pytest.approx(
+        [0.5, 0.9, 1.7]
+    )
+
+
+async def test_tts_rest_does_not_retry_other_errors(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test only rate limiting is retried over REST."""
+    mock_fishaudio_client.tts.convert.side_effect = ServerError(500, "Server error")
+
+    with pytest.raises(HomeAssistantError, match="TTS request failed"):
+        await tts_entity.async_get_tts_audio(message="Hello", language="en", options={})
+
+    mock_fishaudio_client.tts.convert.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        pytest.param(
+            RateLimitError(429, "Too many"), "Rate limited", id="rate-limited"
+        ),
+        pytest.param(ServerError(500, "Server error"), "TTS request failed", id="api"),
+    ],
+)
+async def test_tts_stream_api_error_after_audio(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+    error: Exception,
+    message: str,
+) -> None:
+    """Test an API error after audio started is raised with a clear message."""
+
+    async def stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        yield b"partial"
+        raise error
+
+    mock_fishaudio_client.tts.stream_websocket.side_effect = stream
+    response = await tts_entity.async_stream_tts_audio(
+        TTSAudioRequest(language="en", options={}, message_gen=_message("Hello"))
+    )
+
+    assert await anext(response.data_gen) == b"partial"
+    with pytest.raises(HomeAssistantError, match=message) as exc_info:
+        await anext(response.data_gen)
+    assert not isinstance(exc_info.value, UnexpectedError)

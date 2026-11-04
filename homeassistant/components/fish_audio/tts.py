@@ -1,10 +1,14 @@
 """TTS platform for the Fish Audio integration."""
 
-from collections.abc import AsyncGenerator
+import asyncio
+from collections.abc import AsyncGenerator, AsyncIterator
 from enum import StrEnum
 import logging
+import random
+import re
 from typing import Any, override
 
+from fishaudio import FlushEvent
 from fishaudio.exceptions import (
     APIError,
     AuthenticationError,
@@ -42,6 +46,26 @@ from .types import FishAudioConfigEntry
 PARALLEL_UPDATES = 1
 _LOGGER = logging.getLogger(__name__)
 
+# Fish Audio limits concurrent requests per account (5 on the entry tier),
+# shared with its other API calls; an open WebSocket holds a slot.
+MAX_CONCURRENT_REQUESTS = 3
+
+# Waits before each REST retry after HTTP 429, plus up to 50% jitter.
+RETRY_DELAYS = (0.4, 0.8, 1.6)
+
+# Fish Audio advises sending complete words, 5 to 10 at a time.
+WORDS_PER_CHUNK = 5
+# Send text without spaces (Chinese, Japanese) once this much is buffered.
+MAX_BUFFER_CHARS = 100
+
+# REST would fail the same way, so these are not retried over REST.
+_NO_FALLBACK_STATUSES = {401, 402, 403}
+
+# Whitespace, or the point after CJK end punctuation, which has no space.
+_BOUNDARY = re.compile(r"\s+|(?<=[。！？])")
+# A word ending a sentence, allowing closing quotes or brackets.
+_SENTENCE_END = re.compile(r"[.!?。！？][\"'”’)\]]*$")
+
 
 _UPGRADE_ERRORS = {
     401: "Invalid Fish Audio API key",
@@ -70,6 +94,97 @@ async def _close_stream(stream: AsyncGenerator[bytes]) -> None:
             raise rest from None
 
 
+def _next_chunk(buffer: str) -> tuple[str, str, bool] | None:
+    """Split the next chunk off the buffer, or return None to wait for more.
+
+    Returns (chunk, rest, ends_sentence). A chunk ends at the first sentence
+    end or after WORDS_PER_CHUNK whole words.
+    """
+    words = 0
+    start = 0
+    for match in _BOUNDARY.finditer(buffer):
+        segment = buffer[start : match.start()]
+        start = match.end()
+        if not segment.strip():
+            continue
+        words += 1
+        ends_sentence = (
+            "\n" in match.group() or _SENTENCE_END.search(segment) is not None
+        )
+        if ends_sentence or words >= WORDS_PER_CHUNK:
+            return buffer[: match.end()], buffer[match.end() :], ends_sentence
+    if len(buffer) >= MAX_BUFFER_CHARS:
+        return buffer, "", False
+    return None
+
+
+async def _buffered_text(
+    source: AsyncIterator[str],
+) -> AsyncGenerator[str | FlushEvent]:
+    """Regroup streamed text into whole words, flushing at sentence ends."""
+    buffer = ""
+    async for text in source:
+        buffer += text
+        while (split := _next_chunk(buffer)) is not None:
+            chunk, buffer, ends_sentence = split
+            yield chunk
+            if ends_sentence:
+                yield FlushEvent()
+    if buffer.strip():
+        yield buffer
+
+
+class _TextPump:
+    """Read the message stream once, keeping a copy for a REST fallback.
+
+    The SDK reads text in its own task and does not stop it when the
+    WebSocket fails, so the message stream can't be read a second time.
+    """
+
+    def __init__(self, hass: HomeAssistant, message_gen: AsyncIterator[str]) -> None:
+        """Start reading the message stream."""
+        self._parts: list[str] = []
+        self._error: Exception | None = None
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._task = hass.async_create_background_task(
+            self._pump(message_gen), name="fish_audio text pump"
+        )
+
+    async def _pump(self, message_gen: AsyncIterator[str]) -> None:
+        try:
+            async for text in message_gen:
+                self._parts.append(text)
+                self._queue.put_nowait(text)
+        except Exception as err:  # noqa: BLE001
+            self._error = err
+        finally:
+            self._queue.put_nowait(None)
+
+    async def stream(self) -> AsyncGenerator[str]:
+        """Yield text as it arrives.
+
+        Ends normally if the message stream failed: an error here would only
+        reach the SDK's sender task and leave the WebSocket waiting.
+        """
+        while (text := await self._queue.get()) is not None:
+            yield text
+
+    def raise_error(self) -> None:
+        """Raise the error the message stream failed with, if any."""
+        if self._error is not None:
+            raise self._error
+
+    async def full_text(self) -> str:
+        """Wait for the whole message, including what was already streamed."""
+        await self._task
+        self.raise_error()
+        return "".join(self._parts)
+
+    def cancel(self) -> None:
+        """Stop reading the message stream."""
+        self._task.cancel()
+
+
 class FishAudioTextToSpeechOption(StrEnum):
     """Store keys for the Fish Audio text-to-speech options."""
 
@@ -86,6 +201,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up Fish Audio TTS platform."""
     _LOGGER.debug("Setting up Fish Audio TTS platform")
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
     _LOGGER.debug("Entry: %s", entry)
     # Iterate over values
@@ -94,7 +210,7 @@ async def async_setup_entry(
         if subentry.subentry_type != "tts":
             continue
         async_add_entities(
-            [FishAudioTTSEntity(entry, subentry)],
+            [FishAudioTTSEntity(entry, subentry, semaphore)],
             config_subentry_id=subentry.subentry_id,
         )
 
@@ -110,9 +226,15 @@ class FishAudioTTSEntity(TextToSpeechEntity):
         FishAudioTextToSpeechOption.SPEED,
     ]
 
-    def __init__(self, entry: FishAudioConfigEntry, sub_entry: ConfigSubentry) -> None:
+    def __init__(
+        self,
+        entry: FishAudioConfigEntry,
+        sub_entry: ConfigSubentry,
+        semaphore: asyncio.Semaphore,
+    ) -> None:
         """Initialize the TTS entity."""
         self._entry = entry
+        self._semaphore = semaphore
         self.client = entry.runtime_data
         self.sub_entry = sub_entry
         self._attr_unique_id = sub_entry.subentry_id
@@ -197,26 +319,57 @@ class FishAudioTTSEntity(TextToSpeechEntity):
 
         voice_id, backend, latency, speed = self._get_options(options)
 
-        try:
-            audio = await self.client.tts.convert(
-                text=message,
-                reference_id=voice_id,
-                latency=latency,
-                speed=speed,
-                model=backend,
-                format="mp3",
-            )
-        except AuthenticationError as err:
-            self._entry.async_start_reauth(self.hass)
-            raise HomeAssistantError(_UPGRADE_ERRORS[401]) from err
-        except RateLimitError as err:
-            raise HomeAssistantError(f"Rate limited: {err}") from err
-        except APIError as err:
-            raise HomeAssistantError(f"TTS request failed: {err}") from err
-        except Exception as err:
-            raise UnexpectedError(err) from err
+        async with self._semaphore:
+            audio = await self._convert(message, voice_id, backend, latency, speed)
 
         return "mp3", audio
+
+    async def _convert(
+        self, text: str, voice_id: str, backend: str, latency: str, speed: float
+    ) -> bytes:
+        """Synthesize over REST, retrying when rate limited."""
+        delays = iter(RETRY_DELAYS)
+        while True:
+            try:
+                return await self.client.tts.convert(
+                    text=text,
+                    reference_id=voice_id,
+                    latency=latency,
+                    speed=speed,
+                    model=backend,
+                    format="mp3",
+                )
+            except AuthenticationError as err:
+                self._entry.async_start_reauth(self.hass)
+                raise HomeAssistantError(_UPGRADE_ERRORS[401]) from err
+            except RateLimitError as err:
+                if (delay := next(delays, None)) is None:
+                    raise HomeAssistantError(f"Rate limited: {err}") from err
+                await asyncio.sleep(delay + random.uniform(0, delay / 2))
+            except APIError as err:
+                raise HomeAssistantError(f"TTS request failed: {err}") from err
+            except Exception as err:
+                raise UnexpectedError(err) from err
+
+    def _stream_error(self, err: Exception) -> HomeAssistantError:
+        """Translate a streaming error, starting reauth for a rejected key."""
+        if isinstance(err, RateLimitError):
+            return HomeAssistantError(f"Rate limited: {err}")
+        if isinstance(err, APIError):
+            return HomeAssistantError(f"TTS request failed: {err}")
+        if isinstance(err, WebSocketError):
+            return HomeAssistantError(
+                f"Websocket connection closed unexpectedly: {err}"
+            )
+        if (status := _upgrade_status(err)) is None:
+            return UnexpectedError(err)
+        if status == 401:
+            self._entry.async_start_reauth(self.hass)
+        return HomeAssistantError(
+            _UPGRADE_ERRORS.get(
+                status, f"Fish Audio refused the connection (HTTP {status})"
+            )
+        )
 
     @override
     async def async_stream_tts_audio(
@@ -226,39 +379,53 @@ class FishAudioTTSEntity(TextToSpeechEntity):
 
         voice_id, backend, latency, speed = self._get_options(request.options)
 
-        stream = self.client.tts.stream_websocket(
-            request.message_gen,
-            reference_id=voice_id,
-            latency=latency,
-            speed=speed,
-            model=backend,
-            format="mp3",
+        return TTSAudioResponse(
+            "mp3",
+            self._stream_audio(request.message_gen, voice_id, backend, latency, speed),
         )
 
-        async def gen() -> AsyncGenerator[bytes]:
+    async def _stream_audio(
+        self,
+        message_gen: AsyncIterator[str],
+        voice_id: str,
+        backend: str,
+        latency: str,
+        speed: float,
+    ) -> AsyncGenerator[bytes]:
+        """Stream over the WebSocket, falling back to REST before any audio."""
+        async with self._semaphore:
+            pump = _TextPump(self.hass, message_gen)
+            started = False
             try:
-                async for chunk in stream:
-                    yield chunk
-
-            except RateLimitError as err:
-                raise HomeAssistantError(f"Rate limited: {err}") from err
-            except APIError as err:
-                raise HomeAssistantError(f"TTS request failed: {err}") from err
-            except WebSocketError as err:
-                raise HomeAssistantError(
-                    f"Websocket connection closed unexpectedly: {err}"
-                ) from err
-            except Exception as err:
-                if (status := _upgrade_status(err)) is None:
-                    raise UnexpectedError(err) from err
-                if status == 401:
-                    self._entry.async_start_reauth(self.hass)
-                raise HomeAssistantError(
-                    _UPGRADE_ERRORS.get(
-                        status, f"Fish Audio refused the connection (HTTP {status})"
+                stream = self.client.tts.stream_websocket(
+                    _buffered_text(pump.stream()),
+                    reference_id=voice_id,
+                    latency=latency,
+                    speed=speed,
+                    model=backend,
+                    format="mp3",
+                )
+                try:
+                    try:
+                        async for chunk in stream:
+                            started = True
+                            yield chunk
+                    finally:
+                        await _close_stream(stream)
+                except Exception as err:
+                    if started or _upgrade_status(err) in _NO_FALLBACK_STATUSES:
+                        raise self._stream_error(err) from err
+                    _LOGGER.warning(
+                        "Fish Audio WebSocket failed before any audio (%r), "
+                        "retrying over REST",
+                        err,
                     )
-                ) from err
-            finally:
-                await _close_stream(stream)
+                else:
+                    pump.raise_error()
+                    return
 
-        return TTSAudioResponse("mp3", gen())
+                text = await pump.full_text()
+                if text.strip():
+                    yield await self._convert(text, voice_id, backend, latency, speed)
+            finally:
+                pump.cancel()
