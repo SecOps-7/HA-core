@@ -58,9 +58,6 @@ WORDS_PER_CHUNK = 5
 # Send text without spaces (Chinese, Japanese) once this much is buffered.
 MAX_BUFFER_CHARS = 100
 
-# REST would fail the same way, so these are not retried over REST.
-_NO_FALLBACK_STATUSES = {401, 402, 403}
-
 # Whitespace, or the point after CJK end punctuation, which has no space.
 _BOUNDARY = re.compile(r"\s+|(?<=[。！？])")
 # A word ending a sentence, allowing closing quotes or brackets.
@@ -134,55 +131,19 @@ async def _buffered_text(
         yield buffer
 
 
-class _TextPump:
-    """Read the message stream once, keeping a copy for a REST fallback.
+async def _end_on_error(
+    message_gen: AsyncIterator[str], errors: list[Exception]
+) -> AsyncGenerator[str]:
+    """Yield the message, ending normally if it fails and recording the error.
 
-    The SDK reads text in its own task and does not stop it when the
-    WebSocket fails, so the message stream can't be read a second time.
+    The SDK reads the message in its own task: an error there would never
+    reach us, and the SDK would not send "stop", leaving the WebSocket open.
     """
-
-    def __init__(self, hass: HomeAssistant, message_gen: AsyncIterator[str]) -> None:
-        """Start reading the message stream."""
-        self._parts: list[str] = []
-        self._error: Exception | None = None
-        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
-        self._task = hass.async_create_background_task(
-            self._pump(message_gen), name="fish_audio text pump"
-        )
-
-    async def _pump(self, message_gen: AsyncIterator[str]) -> None:
-        try:
-            async for text in message_gen:
-                self._parts.append(text)
-                self._queue.put_nowait(text)
-        except Exception as err:  # noqa: BLE001
-            self._error = err
-        finally:
-            self._queue.put_nowait(None)
-
-    async def stream(self) -> AsyncGenerator[str]:
-        """Yield text as it arrives.
-
-        Ends normally if the message stream failed: an error here would only
-        reach the SDK's sender task and leave the WebSocket waiting.
-        """
-        while (text := await self._queue.get()) is not None:
+    try:
+        async for text in message_gen:
             yield text
-
-    def raise_error(self) -> None:
-        """Raise the error the message stream failed with, if any."""
-        if self._error is not None:
-            raise self._error
-
-    async def full_text(self) -> str:
-        """Wait for the whole message, including what was already streamed."""
-        await self._task
-        self.raise_error()
-        return "".join(self._parts)
-
-    def cancel(self) -> None:
-        """Stop reading the message stream."""
-        self._task.cancel()
+    except Exception as err:  # noqa: BLE001
+        errors.append(err)
 
 
 class FishAudioTextToSpeechOption(StrEnum):
@@ -392,40 +353,24 @@ class FishAudioTTSEntity(TextToSpeechEntity):
         latency: str,
         speed: float,
     ) -> AsyncGenerator[bytes]:
-        """Stream over the WebSocket, falling back to REST before any audio."""
+        """Stream the message over the WebSocket."""
         async with self._semaphore:
-            pump = _TextPump(self.hass, message_gen)
-            started = False
+            message_errors: list[Exception] = []
+            stream = self.client.tts.stream_websocket(
+                _buffered_text(_end_on_error(message_gen, message_errors)),
+                reference_id=voice_id,
+                latency=latency,
+                speed=speed,
+                model=backend,
+                format="mp3",
+            )
             try:
-                stream = self.client.tts.stream_websocket(
-                    _buffered_text(pump.stream()),
-                    reference_id=voice_id,
-                    latency=latency,
-                    speed=speed,
-                    model=backend,
-                    format="mp3",
-                )
                 try:
-                    try:
-                        async for chunk in stream:
-                            started = True
-                            yield chunk
-                    finally:
-                        await _close_stream(stream)
-                except Exception as err:
-                    if started or _upgrade_status(err) in _NO_FALLBACK_STATUSES:
-                        raise self._stream_error(err) from err
-                    _LOGGER.warning(
-                        "Fish Audio WebSocket failed before any audio (%r), "
-                        "retrying over REST",
-                        err,
-                    )
-                else:
-                    pump.raise_error()
-                    return
-
-                text = await pump.full_text()
-                if text.strip():
-                    yield await self._convert(text, voice_id, backend, latency, speed)
-            finally:
-                pump.cancel()
+                    async for chunk in stream:
+                        yield chunk
+                finally:
+                    await _close_stream(stream)
+            except Exception as err:
+                raise self._stream_error(err) from err
+            if message_errors:
+                raise message_errors[0]
