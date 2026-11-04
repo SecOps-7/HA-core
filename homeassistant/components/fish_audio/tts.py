@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
 from enum import StrEnum
 import logging
-import random
 import re
 from typing import Any, override
 
@@ -49,9 +48,6 @@ _LOGGER = logging.getLogger(__name__)
 # Fish Audio limits concurrent requests per account (5 on the entry tier),
 # shared with its other API calls; an open WebSocket holds a slot.
 MAX_CONCURRENT_REQUESTS = 3
-
-# Waits before each REST retry after HTTP 429, plus up to 50% jitter.
-RETRY_DELAYS = (0.4, 0.8, 1.6)
 
 # Fish Audio advises sending complete words, 5 to 10 at a time.
 WORDS_PER_CHUNK = 5
@@ -280,37 +276,27 @@ class FishAudioTTSEntity(TextToSpeechEntity):
 
         voice_id, backend, latency, speed = self._get_options(options)
 
-        async with self._semaphore:
-            audio = await self._convert(message, voice_id, backend, latency, speed)
-
-        return "mp3", audio
-
-    async def _convert(
-        self, text: str, voice_id: str, backend: str, latency: str, speed: float
-    ) -> bytes:
-        """Synthesize over REST, retrying when rate limited."""
-        delays = iter(RETRY_DELAYS)
-        while True:
-            try:
-                return await self.client.tts.convert(
-                    text=text,
+        try:
+            async with self._semaphore:
+                audio = await self.client.tts.convert(
+                    text=message,
                     reference_id=voice_id,
                     latency=latency,
                     speed=speed,
                     model=backend,
                     format="mp3",
                 )
-            except AuthenticationError as err:
-                self._entry.async_start_reauth(self.hass)
-                raise HomeAssistantError(_UPGRADE_ERRORS[401]) from err
-            except RateLimitError as err:
-                if (delay := next(delays, None)) is None:
-                    raise HomeAssistantError(f"Rate limited: {err}") from err
-                await asyncio.sleep(delay + random.uniform(0, delay / 2))
-            except APIError as err:
-                raise HomeAssistantError(f"TTS request failed: {err}") from err
-            except Exception as err:
-                raise UnexpectedError(err) from err
+        except AuthenticationError as err:
+            self._entry.async_start_reauth(self.hass)
+            raise HomeAssistantError(_UPGRADE_ERRORS[401]) from err
+        except RateLimitError as err:
+            raise HomeAssistantError(f"Rate limited: {err}") from err
+        except APIError as err:
+            raise HomeAssistantError(f"TTS request failed: {err}") from err
+        except Exception as err:
+            raise UnexpectedError(err) from err
+
+        return "mp3", audio
 
     def _stream_error(self, err: Exception) -> HomeAssistantError:
         """Translate a streaming error, starting reauth for a rejected key."""

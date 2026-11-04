@@ -1,12 +1,12 @@
 """Tests for the Fish Audio TTS entity."""
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterable, Callable, Generator
+from collections.abc import AsyncGenerator, AsyncIterable, Callable
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fishaudio import AsyncFishAudio, AuthenticationError, FlushEvent, RateLimitError
 from fishaudio.exceptions import ServerError, WebSocketError
@@ -50,13 +50,6 @@ def tts_mutagen_mock_fixture_autouse(tts_mutagen_mock: MagicMock) -> None:
 @pytest.fixture(autouse=True)
 def mock_tts_cache_dir_autouse(mock_tts_cache_dir: Path) -> None:
     """Mock the TTS cache dir with empty dir."""
-
-
-@pytest.fixture(autouse=True)
-def no_retry_delay() -> Generator[None]:
-    """Retry REST rate limits without waiting."""
-    with patch("homeassistant.components.fish_audio.tts.RETRY_DELAYS", (0, 0, 0)):
-        yield
 
 
 @pytest.fixture(autouse=True)
@@ -175,8 +168,7 @@ async def test_tts_rate_limited(
         )
 
     # Verify the client was called
-    # The first attempt and three retries
-    assert mock_fishaudio_client.tts.convert.call_count == 4
+    mock_fishaudio_client.tts.convert.assert_called_once()
 
 
 async def test_tts_missing_voice_id(
@@ -1020,51 +1012,6 @@ async def test_tts_slot_released_when_stream_abandoned(
     ) == ("mp3", b"fake_audio_data")
 
 
-async def test_tts_rest_retries_rate_limit(
-    tts_entity: tts.TextToSpeechEntity,
-    mock_fishaudio_client: AsyncMock,
-) -> None:
-    """Test HTTP 429 over REST is retried with growing waits."""
-    mock_fishaudio_client.tts.convert.side_effect = [
-        RateLimitError(429, "Rate limited"),
-        RateLimitError(429, "Rate limited"),
-        RateLimitError(429, "Rate limited"),
-        b"fake_audio_data",
-    ]
-
-    with (
-        patch("homeassistant.components.fish_audio.tts.RETRY_DELAYS", (0.4, 0.8, 1.6)),
-        patch(
-            "homeassistant.components.fish_audio.tts.random.uniform", return_value=0.1
-        ) as mock_jitter,
-        patch(
-            "homeassistant.components.fish_audio.tts.asyncio.sleep", new=AsyncMock()
-        ) as mock_sleep,
-    ):
-        result = await tts_entity.async_get_tts_audio(
-            message="Hello", language="en", options={}
-        )
-
-    assert result == ("mp3", b"fake_audio_data")
-    assert mock_jitter.call_args_list == [call(0, 0.2), call(0, 0.4), call(0, 0.8)]
-    assert [c.args[0] for c in mock_sleep.await_args_list] == pytest.approx(
-        [0.5, 0.9, 1.7]
-    )
-
-
-async def test_tts_rest_does_not_retry_other_errors(
-    tts_entity: tts.TextToSpeechEntity,
-    mock_fishaudio_client: AsyncMock,
-) -> None:
-    """Test only rate limiting is retried over REST."""
-    mock_fishaudio_client.tts.convert.side_effect = ServerError(500, "Server error")
-
-    with pytest.raises(HomeAssistantError, match="TTS request failed"):
-        await tts_entity.async_get_tts_audio(message="Hello", language="en", options={})
-
-    mock_fishaudio_client.tts.convert.assert_called_once()
-
-
 @pytest.mark.parametrize(
     ("error", "message"),
     [
@@ -1109,3 +1056,14 @@ async def test_tts_stream_error_before_audio(
     with pytest.raises(UnexpectedError):
         await _stream_refused(tts_entity)
     mock_fishaudio_client.tts.convert.assert_not_called()
+
+
+async def test_tts_rest_api_error(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test an API error over REST is reported as a failed request."""
+    mock_fishaudio_client.tts.convert.side_effect = ServerError(500, "Server error")
+
+    with pytest.raises(HomeAssistantError, match="TTS request failed"):
+        await tts_entity.async_get_tts_audio(message="Hello", language="en", options={})
