@@ -28,14 +28,9 @@ TTS_SUPPORTED_LANGUAGES = [
 ]
 
 
-BACKEND_MODELS = [
-    "s2.1-pro",
-    "s2.1-pro-free",
-    "s2-pro",
-    "s1",
-    "speech-1.5",
-    "speech-1.6",
-]
+# Sent verbatim as the model header. Fish Audio serves an unknown model as
+# s2.1-pro without an error, so these must match its API exactly.
+BACKEND_MODELS = ["s2.1-pro", "s2.1-pro-free", "s2-pro", "drama-3", "s1"]
 SORT_BY_OPTIONS = ["task_count", "score", "created_at"]
 LATENCY_OPTIONS = ["normal", "balanced"]
 

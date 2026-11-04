@@ -25,6 +25,7 @@ from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import (
+    BACKEND_MODELS,
     CONF_BACKEND,
     CONF_LATENCY,
     CONF_SPEED,
@@ -165,6 +166,16 @@ class FishAudioTTSEntity(TextToSpeechEntity):
             raise ServiceValidationError("Voice ID not configured")
         if backend is None:
             raise ServiceValidationError("Backend model not configured")
+        # Fish Audio would silently use s2.1-pro for a mistyped model. Stored
+        # values are not checked, so existing voices keep working.
+        if (
+            FishAudioTextToSpeechOption.BACKEND in options
+            and backend not in BACKEND_MODELS
+        ):
+            raise ServiceValidationError(
+                f"Unknown Fish Audio model '{backend}'. "
+                f"Valid models: {', '.join(BACKEND_MODELS)}"
+            )
         if not MIN_SPEED <= speed <= MAX_SPEED:
             raise ServiceValidationError(
                 f"Speed must be between {MIN_SPEED} and {MAX_SPEED}"

@@ -6,9 +6,9 @@ from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from fishaudio import AuthenticationError, RateLimitError
+from fishaudio import AsyncFishAudio, AuthenticationError, RateLimitError
 from fishaudio.exceptions import ServerError
 from httpx_ws import WebSocketUpgradeError
 import pytest
@@ -17,6 +17,7 @@ from pytest_homeassistant.typing import ClientSessionGenerator
 
 from homeassistant.components import tts
 from homeassistant.components.fish_audio.const import (
+    BACKEND_MODELS,
     CONF_BACKEND,
     CONF_LATENCY,
     CONF_SPEED,
@@ -638,3 +639,123 @@ async def test_tts_stream_unknown_error(
 
     with pytest.raises(UnexpectedError):
         await _stream_refused(tts_entity)
+
+
+# The model header values in Fish Audio's API reference, written out so a
+# typo in BACKEND_MODELS fails here.
+FISH_API_MODELS = ["s2.1-pro", "s2.1-pro-free", "s2-pro", "drama-3", "s1"]
+
+
+def test_backend_models_match_fish_api() -> None:
+    """Test the offered models are exactly the ones Fish Audio accepts."""
+    assert BACKEND_MODELS == FISH_API_MODELS
+
+
+@pytest.mark.parametrize("model", FISH_API_MODELS)
+async def test_model_header_rest(
+    hass: HomeAssistant,
+    tts_entity: tts.TextToSpeechEntity,
+    model: str,
+) -> None:
+    """Test the exact model string reaches the SDK's REST request header."""
+    # The real SDK client: the integration's AsyncFishAudio is mocked here.
+    tts_entity.client = AsyncFishAudio(api_key="test-api-key")
+
+    with (
+        patch(
+            "fishaudio.core.client_wrapper.AsyncClientWrapper.request",
+            side_effect=RuntimeError("request recorded"),
+        ) as mock_request,
+        pytest.raises(UnexpectedError),
+    ):
+        await tts_entity.async_get_tts_audio(
+            message="Hello", language="en", options={"backend": model}
+        )
+
+    assert mock_request.call_args.args[1] == "/v1/tts"
+    assert mock_request.call_args.kwargs["headers"]["model"] == model
+
+
+@pytest.mark.parametrize("model", FISH_API_MODELS)
+async def test_model_header_stream(
+    hass: HomeAssistant,
+    tts_entity: tts.TextToSpeechEntity,
+    model: str,
+) -> None:
+    """Test the exact model string reaches the WebSocket handshake header."""
+    # The real SDK client: the integration's AsyncFishAudio is mocked here.
+    tts_entity.client = AsyncFishAudio(api_key="test-api-key")
+
+    async def message() -> AsyncGenerator[str]:
+        yield "Hello"
+
+    with patch(
+        "fishaudio.resources.tts.aconnect_ws",
+        side_effect=RuntimeError("handshake recorded"),
+    ) as mock_connect:
+        response = await tts_entity.async_stream_tts_audio(
+            TTSAudioRequest(
+                language="en", options={"backend": model}, message_gen=message()
+            )
+        )
+        with pytest.raises(UnexpectedError):
+            [chunk async for chunk in response.data_gen]
+
+    assert mock_connect.call_args.args[0] == "/v1/tts/live"
+    assert mock_connect.call_args.kwargs["headers"]["model"] == model
+
+
+@pytest.mark.parametrize("backend", ["s2.1pro", "S2.1-Pro", "drama3", "speech-1.6"])
+async def test_tts_unknown_model_override_rejected(
+    tts_entity: tts.TextToSpeechEntity,
+    mock_fishaudio_client: AsyncMock,
+    backend: str,
+) -> None:
+    """Test a per-call model Fish Audio doesn't accept is rejected, not sent."""
+
+    async def message() -> AsyncGenerator[str]:
+        yield "Hello"
+
+    with pytest.raises(ServiceValidationError, match="Unknown Fish Audio model"):
+        await tts_entity.async_stream_tts_audio(
+            TTSAudioRequest(
+                language="en", options={"backend": backend}, message_gen=message()
+            )
+        )
+    with pytest.raises(ServiceValidationError, match="Unknown Fish Audio model"):
+        await tts_entity.async_get_tts_audio(
+            message="Hello", language="en", options={"backend": backend}
+        )
+
+    mock_fishaudio_client.tts.stream_websocket.assert_not_called()
+    mock_fishaudio_client.tts.convert.assert_not_called()
+
+
+async def test_tts_stored_retired_model_still_used(
+    hass: HomeAssistant,
+    mock_fishaudio_client: AsyncMock,
+) -> None:
+    """Test a voice saved with a model no longer offered keeps working."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_API_KEY: "test-key"},
+        unique_id="test_user",
+        subentries_data=[
+            ConfigSubentryData(
+                data={CONF_VOICE_ID: "voice-123", CONF_BACKEND: "speech-1.6"},
+                subentry_type="tts",
+                title="Test Voice",
+                subentry_id="test-sub-id",
+                unique_id="voice-123-speech-1.6",
+            )
+        ],
+    )
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    entity = hass.data[tts.DOMAIN].get_entity("tts.test_voice_test_voice")
+    assert entity is not None
+
+    await entity.async_get_tts_audio(message="Hello", language="en", options={})
+
+    assert mock_fishaudio_client.tts.convert.call_args.kwargs["model"] == "speech-1.6"

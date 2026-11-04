@@ -62,6 +62,17 @@ from .types import FishAudioConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
+DEFAULT_BACKEND = "s2.1-pro"
+
+# Plain labels: translation keys can't contain the "." in "s2.1-pro".
+BACKEND_MODEL_LABELS = {
+    "s2.1-pro": "S2.1 Pro (recommended)",
+    "s2.1-pro-free": "S2.1 Pro Free (no credit needed, fair use, no latency guarantee)",
+    "s2-pro": "S2 Pro (previous generation)",
+    "drama-3": "Drama 3 (directable, billed by text size)",
+    "s1": "S1 (deprecated, retired 31 Dec 2026)",
+}
+
 
 def get_api_key_schema(default: str | None = None) -> probatio.Schema:
     """Return the schema for API key input."""
@@ -121,11 +132,12 @@ def get_model_selection_schema(
             ),
             probatio.Required(
                 CONF_BACKEND,
-                default=options.get(CONF_BACKEND, "s2-pro"),
+                default=options.get(CONF_BACKEND, DEFAULT_BACKEND),
             ): SelectSelector(
                 SelectSelectorConfig(
                     options=[
-                        SelectOptionDict(value=opt, label=opt) for opt in BACKEND_MODELS
+                        SelectOptionDict(value=opt, label=BACKEND_MODEL_LABELS[opt])
+                        for opt in BACKEND_MODELS
                     ],
                     mode=SelectSelectorMode.DROPDOWN,
                 )

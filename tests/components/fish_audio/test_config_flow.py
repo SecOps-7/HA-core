@@ -420,3 +420,39 @@ async def test_subflow_entry_not_loaded(
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "entry_not_loaded"
+
+
+async def test_subflow_model_options(
+    hass: HomeAssistant,
+    mock_fishaudio_client: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the model dropdown offers Fish Audio's current models."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+
+    result = await hass.config_entries.subentries.async_init(
+        (mock_config_entry.entry_id, "tts"),
+        context={"source": SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_TITLE: "",
+            CONF_LANGUAGE: "en",
+            CONF_SORT_BY: "task_count",
+            CONF_SELF_ONLY: False,
+        },
+    )
+    assert result["step_id"] == "model"
+
+    schema = result["data_schema"].schema
+    backend_key = next(key for key in schema if key == CONF_BACKEND)
+    assert backend_key.default() == "s2.1-pro"
+    labels = {
+        option["value"]: option["label"]
+        for option in schema[backend_key].config["options"]
+    }
+    assert list(labels) == ["s2.1-pro", "s2.1-pro-free", "s2-pro", "drama-3", "s1"]
+    assert "recommended" in labels["s2.1-pro"]
+    assert "deprecated" in labels["s1"]
